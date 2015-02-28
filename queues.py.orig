@@ -1,0 +1,378 @@
+from Queue import Queue as StandardQueue, Empty
+import amqplib.client_0_8 as amqp
+
+from multiprocessing import JoinableQueue
+
+from slac_utils.time import sleep
+from uuid import uuid1 as uuid
+
+try:
+   import cPickle as pickle
+except:
+   import pickle
+import json
+
+import logging
+
+
+END_MARKER = '===END==='
+
+class Queue( object):
+    """
+    simulate the standard python queue object
+    """
+    q = []
+    
+    def __init__(self):
+        self.q = []
+        
+    def __enter__(self):
+        return self
+        
+    def __exit__( self, *args, **kwargs ):
+        pass
+    
+    def __nonzero__(self):
+        """
+        enable use of if Queue():, in this case, we're a dummy class so it's not
+        """
+        return False
+    
+    def put( self, item, **kwargs ):
+        """ puts the item into the queue """
+        pass
+        
+    def get( self, non_blocking=True, **kwargs ):
+        """ gets a single item from teh queue, if non_blocking, then may return None """
+        pass
+        
+    def consume( self, callback, limit=0, **kwargs ):
+        """
+        get from queue and call the callback with the item in the queue forever
+        """
+        raise NotImplementedError, 'consume()'
+        
+    def qsize( self ):
+        """
+        get the estimate sie of the queue
+        """
+        raise NotImplementedError, 'qsize()'
+        
+    def task_done( self ):
+        """
+        mark the task/item as done
+        """
+        raise NotImplementedError, 'task_done()'
+
+    def end( self, **kwargs ):
+        # self.put( END_MARKER )
+        pass
+    
+
+class QueueFactory(object):
+    """
+    simple class that returns queue objects for publish or consume
+    """
+    # options to be passed to construciton of each queue
+    queue_options = {}
+    # use this to remap the keys for incoming constructor arguments to something useable directly by the queue constructor
+    kwargs_remap = {}
+    
+    def __init__(self, *args, **kwargs ):
+        for k,v in kwargs.iteritems():
+            if k in self.kwargs_remap:
+                k = self.kwargs_remap[k]
+            self.queue_options[k] = v
+        # logging.debug( 'created queue factory: %s' %(self.queue_options))
+
+class PyAmqpLibQueueFactory( QueueFactory ):
+    
+    kwargs_remap = { 'vhost': 'virtual_host', 'user': 'userid' }
+    # support for RR of amqp servers
+    host_index = 0
+
+    def get_connection_options( self, **kwargs ):
+        # be mindful of the fact that host can be a list, so if we are at the end
+        for i in ( 'port', 'host', 'virtual_host', 'userid', 'password' ):
+            if i in self.queue_options:
+                if i == 'host' and isinstance( self.queue_options['host'], list ):
+                    kwargs['host'], _tmp, p = self.queue_options[i][self.host_index].partition(':')
+                    if not p == '':
+                        self.queue_options['port'] = int(p)
+                    # next index
+                    self.host_index = self.host_index + 1
+                    if self.host_index >= len(self.queue_options['host']):
+                        self.host_index = 0
+                else:
+                    kwargs[i] = self.queue_options[i]
+        return kwargs
+        
+    def get_connection( self, **kwargs ):
+        """
+        allow connection pooling buy getting this object first, then supplying it to the other methods 
+        """
+        # conn = None
+        # n = 1
+        # if isinstance( self.queue_options['host'], list ):
+        #     n = len(self.queue_options['host'])
+        kwargs = {}
+        num_hosts = 1
+        if isinstance( self.queue_options['host'], list ):
+            num_hosts = len(self.queue_options['host'])
+        c = 0
+        while True:
+            try:
+                c = c + 1
+                if c > num_hosts:
+                    sleep( 5 )
+                kwargs = self.get_connection_options()
+                logging.debug( 'connecting to message broker %s:%s' % (kwargs['host'],kwargs['port']))
+                conn = amqp.Connection( **kwargs )
+                return conn
+            except Exception,e:
+                logging.warn("could not connect to %s:%s%s %s" % (kwargs['host'],kwargs['port'],kwargs['virtual_host'],e) )
+                sleep( 1 )
+        
+
+    
+class PyAmqpLibQueue( Queue ):
+    
+    conn = None
+    chan = None
+    _callback = None
+    
+    # tag for acknowledging stuff
+    tag = ''
+    
+    # TODO: pool?
+    
+    host_index = 0
+    host = 'localhost'
+    active_host = None
+    port = 5672
+    active_port = None
+    virtual_host = '/'
+    userid =    'guest'
+    password =  'guest'
+        
+    exchange_name = 'generic'
+    type    = 'direct'
+    pool = 'default'
+    queue_name = 'q'
+    keys    = ('#',)
+    durable = True
+    exclusive = False
+
+    insist  = False
+    auto_delete = True
+    no_ack  = False
+    queue_arguments = None
+    
+    queues_declared = False
+    consuming = False
+    
+    format = 'pickle' # | json
+    
+    def __init__(self, **kwargs):
+        # logging.warn("init queue: %s" % (kwargs,) )
+        for k in ( 'port', 'host', 'virtual_host', 'userid', 'password', 'exchange_name', 'type', 'pool', 'queue_name', 'keys', 'format', 'queue_arguments' ):
+            if k in kwargs and not kwargs[k] == None:
+                setattr( self, k, kwargs[k] )
+                # logging.debug("  set %s %s -> %s" % (k,kwargs[k],getattr(self,k)))
+        self.queue_name = "%s@%s.[%s]" % ( self.exchange_name, self.pool, ':'.join( self.keys ) )
+        self.tag = str(uuid())
+        self.conn = kwargs['connection'] if 'connection' in kwargs else None
+        self.chan = None
+        self.queues_declared = False
+
+    def __nonzero__(self):
+        return True
+
+    def __str__(self):
+        return '<PyAmqpLibQueue at 0x%x amqp://%s:%s%s, %s exchange: %s q: %s>' % (id(self),self.host,self.port, self.virtual_host, self.type, self.exchange_name, self.queue_name )
+
+    def __enter__(self):
+        # reuse a connection if initaited with one
+        if self.conn:
+            # logging.warn("  reusing connection")
+            pass
+        else:
+            # support for RR of amqp hosts
+            self.active_host = self.host
+            self.active_port = self.port
+            if isinstance( self.host, list ):
+                self.active_host, _tmp, p = self.host[self.host_index].partition(':')
+                if not p == '':
+                    self.active_port = int(p)
+                # use the next one next time on __with__
+                self.host_index = self.host_index + 1
+                if self.host_index >= len(self.host):
+                    self.host_index = 0
+            logging.debug("connecting to message broker %s:%s" % (self.active_host,self.active_port))
+            self.conn = amqp.Connection( host=self.active_host, port=self.active_port, virtual_host=self.virtual_host, userid=self.userid, password=self.password )
+            # logging.warn("  new connection %s" % (self.conn,))
+        chan_id = self.conn._get_free_channel_id()
+        self.chan = self.conn.channel( channel_id=chan_id )
+        #logging.warn("  using channel 0x%x (%s) %s" % (id(self) ,chan_id, self.chan))
+        self.chan.access_request( self.virtual_host, active=True, write=True, read=True)
+        self.chan.exchange_declare( exchange=self.exchange_name, type=self.type, durable=self.durable, auto_delete=False )
+        # logging.warn('  declared exchange: %s (%s)' % ( self.exchange_name, self.type ) )
+        # logging.warn( ' %s' % (self,))
+        return self
+        
+    def __exit__(self, *args, **kwargs):
+        if self.chan:
+            try:
+                self.chan.close()
+            except:
+                logging.error("Error closing chan %s" % (self.chan) )
+        self.chan = None
+        if self.conn:
+            try:
+                self.conn.close()
+            except:
+                logging.error("Error closing conn %s" % (self.conn) )
+        self.conn = None
+        
+    def __del__( self ):
+        self.__exit__()
+        
+    def delete( self ):
+        self.chan.queue_delete( self.queue_name )
+
+    def _consumer_start( self, prefetch_count=None ):
+        """ declare that we want to listen for stuff """
+        if prefetch_count:
+            self.chan.basic_qos( prefetch_size=0, prefetch_count=prefetch_count, a_global=False )
+        self.chan.queue_declare( queue=self.queue_name, durable=self.durable, exclusive=self.exclusive, auto_delete=self.auto_delete, arguments=self.queue_arguments )
+        for k in self.keys:
+            logging.debug("  binding key %s on queue %s" % (k,self.queue_name) )
+            self.chan.queue_bind( queue=self.queue_name, exchange=self.exchange_name, routing_key=k )
+        self.queues_declared = True
+        self.consuming = True
+    
+    def get(self, non_blocking=False, poll_time=1):
+        if not self.queues_declared:
+            self._consumer_start()
+        while self.consuming:
+            msg = self.chan.basic_get(self.queue_name, no_ack=True)
+            if msg:
+                body = pickle.loads( msg.body )
+                if body == END_MARKER:
+                    self.consuming = False
+                else:
+                    self.consuming = True
+                    yield body
+            else:
+                sleep( poll_time )
+        return
+        
+    def _consume( self, msg ):
+        # logging.warn( 'consuming msg: %s' % (msg,) )
+        body = None
+        if msg:
+            body = msg.body
+            if self.format == 'pickle':
+                body = pickle.loads( msg.body )
+            elif self.format == 'json':
+                body = json.loads( msg.body )
+            else:
+                raise NotImplementedError, 'unknown serialisation format %s' % self.format
+            if body == END_MARKER:
+                self.consuming = False
+        self._callback( body, msg )
+        
+        
+    def consume( self, callback, no_ack=None, limit=0, format='pickle', prefetch=1 ):
+        logging.debug("consuming %s..."%(self))
+        # we need to unpickle, so we allways call _consume, and let _consume call the callback
+        self._callback = callback
+        self._consumer_start( prefetch_count=prefetch )
+        no_ack = self.no_ack if no_ack == None else no_ack
+        n = 0
+        self.chan.basic_consume( queue=self.queue_name, no_ack=no_ack, callback=self._consume, consumer_tag=self.tag)
+        while self.tag and ( limit == 0 or n < limit ):
+            # logging.debug('waiting on %d (%d)' % (n,limit))
+            self.chan.wait()
+            n = n + 1
+        logging.warn('+++ ending consume')
+        self.chan.basic_cancel( self.tag )
+        
+
+    def _producer_start( self ):
+        pass
+        
+    def put( self, item, key='#', mode=1, headers={} ):
+        if key == None:
+            key = ''
+        self._producer_start()
+        this = item
+        # headers = item['_meta'] if '_meta' in item
+        # del this['_meta']
+        # logging.error("PUT: %s (headers %s)" % (item,headers))
+        # logging.error("PUT: %s (%s): %s" % (key,self.exchange_name,item))
+        body = None
+        if self.format == 'pickle':
+            body = pickle.dumps( item )
+        elif self.format == 'json':
+            body = json.loads( item )
+        else:
+            raise NotImplementedError, 'unknown serialisation format %s' % self.format
+        msg = amqp.Message( body, application_headers=headers )
+        msg.properties['delivery_mode'] = mode
+        self.chan.basic_publish( msg, exchange=self.exchange_name, routing_key=key )
+        
+    def task_done( self, msg ):
+        # logging.warn("task_doen %s" % (msg.delivery_tag,))
+        self.chan.basic_ack( msg.delivery_tag )
+
+    def end( self, key=None ):
+        self.put( END_MARKER, key=key )
+    
+
+class MultiprocessQueue( Queue ):
+    
+    queue = None
+    
+    def __init__(self, **kwargs):
+        self.queue = JoinableQueue()
+
+    def __nonzero__(self):
+        return True
+
+    def __str__(self):
+        return '<MultiProcessQueue at 0x%x>' % (id(self),)
+
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, *args, **kwargs):
+        pass
+        
+    def __del__( self ):
+        self.__exit__()
+        
+    def get(self, non_blocking=False):
+        # body = pickle.load( self.queue.get() )
+        # logging.warn('RCV: %s, body: %s' %(msg, body))
+        return self.queue.get()
+        
+    def consume( self, callback, no_ack=None, limit=0 ):
+        logging.debug("consuming %s..."%(self))
+        while limit == 0 or n < limit:
+            # logging.debug('waiting on %d (%d)' % (n,limit))
+            item = self.get()
+            callback( item, {} )
+            n = n + 1
+        # logging.warn('+++ ending consume')
+    
+    def join( self ):
+        self.queue.join()
+    
+    def put( self, item, **kwargs ):
+        # msg = pickle.dumps(item)
+        self.queue.put( item )
+        
+    def task_done( self, *args ):
+        self.queue.task_done()
+        
