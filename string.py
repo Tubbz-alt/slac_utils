@@ -21,7 +21,7 @@ def strip_ansi(s):
 def strip_non_ascii(s):
     return _string.translate( s, VALID_CHARS )
     
-def dict_to_kv(d,keys=[],join_char=' ',missing_ok=True):
+def dict_to_kv(d,keys=[],join_char=' ',missing_ok=True,modifier="'"):
     """
     convert a dict to a string, optionally use only the keys provided
     """
@@ -36,7 +36,7 @@ def dict_to_kv(d,keys=[],join_char=' ',missing_ok=True):
             else:
                 add = False
         if add:
-            s.append( "%s='%s'" % (k,d[k]))
+            s.append( "%s=%s%s%s" % (k,modifier,d[k],modifier))
     return join_char.join(s)
 
 def flatten( a, b ):
