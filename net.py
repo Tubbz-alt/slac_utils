@@ -195,8 +195,18 @@ def extract_physical_port( str ):
     return None
     
     
-def mac_address( m, format='host' ):
-    m = m.replace('.','').replace(':','').lower()
+def mac_address( mac, format='host' ):
+    m = mac.replace('.','').replace(':','').lower()
+    if len(m) < 12:
+        # try to pad
+        m = ''
+        if ':' in mac:
+            for i in mac.split(":"):
+                if len(i) < 2:
+                    i = '0%s' % i
+                m = m + i
+        if m < 12:
+            raise Exception('not valid mac address')
     if format == 'host':
         a = [ m[i:i+2] for i in xrange(0,len(m),2) ]
         return ':'.join(a)
